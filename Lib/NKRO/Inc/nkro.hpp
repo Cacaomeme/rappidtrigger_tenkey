@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <vector> // C++機能を利用
 
 // NKRO対応のレポート構造体 (17バイト)
 typedef struct {
@@ -15,65 +14,68 @@ typedef struct {
 
 // LEDモード
 enum LedMode : uint8_t {
-    LED_MODE_FADE      = 0,  // キー押下→フェードアウト (デフォルト)
-    LED_MODE_BLINK     = 1,  // キー押下中に点滅
-    LED_MODE_BREATHING = 2,  // 常時呼吸エフェクト
-    LED_MODE_SOLID     = 3,  // キー押下中は常時点灯
-    LED_MODE_OFF       = 4,  // LED消灯
+    LED_MODE_FADE      = 0,
+    LED_MODE_BLINK     = 1,
+    LED_MODE_BREATHING = 2,
+    LED_MODE_SOLID     = 3,
+    LED_MODE_OFF       = 4,
     LED_MODE_COUNT     = 5
 };
 
 // LED設定構造体
 struct LedConfig {
     LedMode mode;
-    uint8_t brightness;  // 最大輝度 (0-255)
-    uint8_t speed;       // エフェクト速度 (0-100, 0.0-10.0の10倍値)
+    uint8_t brightness;
+    uint8_t speed;       // 0-100
 };
 
-// マクロステップ (修飾キー + キーコードの1組)
+// マクロステップ
 #define MAX_MACRO_STEPS 8
 
 struct MacroStep {
-    uint8_t modifiers;  // 修飾キービットマスク
-    uint8_t keycode;    // HIDキーコード
+    uint8_t modifiers;
+    uint8_t keycode;
 };
 
 // Rapid Trigger State for a single key
 struct RapidTriggerState {
-    uint32_t high_peak;      // 押し込みの最深点
-    uint32_t low_peak;       // 戻りの最浅点
-    bool is_active;          // 現在のキー状態
-    
-    uint32_t baseline;       // 初期値 (アイドル値)
-    bool calibrated;         // 初期値取得済みフラグ
-    uint32_t sensitivity;    // 感度 (Rapid Trigger閾値)
-    uint8_t keycode;         // 対応するUSBキーコード
-    uint32_t dead_zone;      // デッドゾーン (baseline付近の不感帯)
+    uint32_t high_peak;
+    uint32_t low_peak;
+    bool is_active;
 
-    // マクロシーケンス (保存対象)
-    uint8_t macro_step_count;            // 0 = マクロなし
+    uint32_t baseline;
+    bool calibrated;
+    uint32_t sensitivity;
+    uint8_t keycode;         // HIDキーコード (0xE0-0xE7 = 修飾キー)
+    uint32_t dead_zone;
+
+    // 初期キャリブレーション用 (ランタイムのみ)
+    uint16_t calibration_samples;
+    uint32_t calibration_sum;
+
+    // マクロシーケンス
+    uint8_t macro_step_count;
     MacroStep macro_steps[MAX_MACRO_STEPS];
 
-    // マクロ実行状態 (ランタイムのみ、保存しない)
-    bool was_active;          // 前回のis_active (遷移検出用)
-    uint8_t macro_exec_step;  // 実行中のステップ番号
-    bool macro_exec_pressing; // true=押下中, false=リリース待ち
-    uint32_t macro_exec_tick; // フェーズ開始時刻 (HAL_GetTick)
+    // マクロ実行状態 (ランタイムのみ)
+    bool was_active;
+    uint8_t macro_exec_step;
+    bool macro_exec_pressing;
+    uint32_t macro_exec_tick;
 };
 
 class RapidTriggerKeyboard {
 public:
     static const int MUX_CH_COUNT = 16;
-    
-    // 現在使用している有効なキーの数（MUX1: 9個, MUX2: 8個 = 17個）
-    static const int TOTAL_KEY_COUNT = 17;
+    static const int SOURCE_COUNT = 7;     // ADCソース数
+    static const int TOTAL_KEY_COUNT = 108; // フルサイズキーボード
 
     RapidTriggerKeyboard();
     void init();
-    
+
     // MUXインデックスとADCソースを指定して更新
     void updateKeyByMux(int muxIndex, int source, uint32_t adcValue);
-    
+
     // 感度
     void setSensitivity(int keyIndex, uint32_t value);
     uint32_t getSensitivity(int keyIndex);
@@ -91,6 +93,10 @@ public:
     uint8_t getMacroStepCount(int keyIndex);
     const MacroStep* getMacroSteps(int keyIndex);
 
+    // デバッグ参照
+    int getMappedKeyIndex(int source, int muxIndex);
+    bool isKeyActive(int keyIndex);
+
     // LED設定
     LedConfig ledConfig;
 
@@ -98,24 +104,21 @@ public:
     void saveToFlash();
     void loadFromFlash();
     void resetDefaults();
-    
-    // デバッグ用: Flash操作の結果コード
+
     int flash_status;
     uint32_t flash_error_code;
     uint32_t flash_debug_val;
 
-    // 現在の状態からレポートを生成して返す
+    // レポート生成
     KeyboardReport* getReport();
 
 private:
-    // マッピング管理用: [Source][MuxIndex] -> StateIndex (-1 if unused)
-    int keyMapping[2][MUX_CH_COUNT];
-    
-    // 全キーの状態配列
+    // [Source][MuxIndex] -> StateIndex (-1 if unused)
+    int keyMapping[SOURCE_COUNT][MUX_CH_COUNT];
+
     RapidTriggerState keyStates[TOTAL_KEY_COUNT];
-    
     KeyboardReport report;
-    
+
     void updateRapidTriggerState(RapidTriggerState& state, uint32_t currentVal);
 };
 

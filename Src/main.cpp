@@ -12,16 +12,12 @@ extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 RapidTriggerKeyboard keyboard;
 
-// LED明るさ制御 (TIM6割り込みで減光)
-// 知覚的な明るさレベル (0-255)。PWMへはガンマ補正(²)で変換する
 volatile uint32_t led_brightness = 0;
 
-// USB経由の設定変更リクエスト (Output Report互換)
 volatile bool config_update_request = false;
 volatile uint8_t config_target = 0;
 volatile uint32_t config_val = 0;
 
-// USBデバッグ変数
 volatile uint8_t last_received_cmd = 0;
 volatile uint16_t last_received_len = 0;
 volatile uint32_t usb_rx_cnt = 0;
@@ -43,60 +39,179 @@ volatile uint8_t last_payload[4] = {0};
 #define CMD_SET_MACRO        0x40
 #define CMD_GET_MACRO        0x41
 
-// 応答ステータス
 #define RESP_OK              0x00
 #define RESP_ERROR           0x01
 #define RESP_INVALID_PARAM   0x02
 
-// Feature Report処理 (SET_REPORT経由で呼ばれる)
-// data: 受信した32バイト, response: 応答を書き込む32バイト (同じバッファ)
+// ===== ADCソース定義 =====
+// 7つのADCソース (各MUXの出力先)
+struct ADCSourceDef {
+    ADC_HandleTypeDef* hadc;
+    uint32_t channel;
+};
+
+static const ADCSourceDef ADC_SOURCES[7] = {
+    { &hadc1, ADC_CHANNEL_1  },  // Source 0: ADC1_IN1  (PA0)
+    { &hadc1, ADC_CHANNEL_2  },  // Source 1: ADC1_IN2  (PA1)
+    { &hadc2, ADC_CHANNEL_3  },  // Source 2: ADC2_IN3  (PA6)
+    { &hadc2, ADC_CHANNEL_4  },  // Source 3: ADC2_IN4  (PA7)
+    { &hadc2, ADC_CHANNEL_10 },  // Source 4: ADC2_IN10 (PF1)
+    { &hadc1, ADC_CHANNEL_10 },  // Source 5: ADC1_IN10 (PF0)
+    { &hadc1, ADC_CHANNEL_15 },  // Source 6: ADC1_IN15 (PB0)
+};
+
+static const char* hidCodeToName(uint8_t code) {
+    static const char* LETTERS[26] = {
+        "A","B","C","D","E","F","G","H","I","J","K","L","M",
+        "N","O","P","Q","R","S","T","U","V","W","X","Y","Z"
+    };
+    static const char* DIGITS[10] = {"1","2","3","4","5","6","7","8","9","0"};
+
+    if (code >= 0x04 && code <= 0x1D) return LETTERS[code - 0x04];
+    if (code >= 0x1E && code <= 0x27) return DIGITS[code - 0x1E];
+
+    switch (code) {
+    case 0x00: return "Unassigned";
+    case 0x28: return "Enter";
+    case 0x29: return "Esc";
+    case 0x2A: return "Backspace";
+    case 0x2B: return "Tab";
+    case 0x2C: return "Space";
+    case 0x2D: return "-";
+    case 0x2E: return "=";
+    case 0x2F: return "[";
+    case 0x30: return "]";
+    case 0x31: return "\\";
+    case 0x33: return ";";
+    case 0x34: return "'";
+    case 0x35: return "`";
+    case 0x36: return ",";
+    case 0x37: return ".";
+    case 0x38: return "/";
+    case 0x39: return "CapsLock";
+    case 0x3A: return "F1";
+    case 0x3B: return "F2";
+    case 0x3C: return "F3";
+    case 0x3D: return "F4";
+    case 0x3E: return "F5";
+    case 0x3F: return "F6";
+    case 0x40: return "F7";
+    case 0x41: return "F8";
+    case 0x42: return "F9";
+    case 0x43: return "F10";
+    case 0x44: return "F11";
+    case 0x45: return "F12";
+    case 0x46: return "PrintScr";
+    case 0x47: return "ScrollLock";
+    case 0x48: return "Pause";
+    case 0x49: return "Insert";
+    case 0x4A: return "Home";
+    case 0x4B: return "PageUp";
+    case 0x4C: return "Delete";
+    case 0x4D: return "End";
+    case 0x4E: return "PageDn";
+    case 0x4F: return "Right";
+    case 0x50: return "Left";
+    case 0x51: return "Down";
+    case 0x52: return "Up";
+    case 0x53: return "NumLock";
+    case 0x54: return "KP/";
+    case 0x55: return "KP*";
+    case 0x56: return "KP-";
+    case 0x57: return "KP+";
+    case 0x58: return "KPEnter";
+    case 0x59: return "KP1";
+    case 0x5A: return "KP2";
+    case 0x5B: return "KP3";
+    case 0x5C: return "KP4";
+    case 0x5D: return "KP5";
+    case 0x5E: return "KP6";
+    case 0x5F: return "KP7";
+    case 0x60: return "KP8";
+    case 0x61: return "KP9";
+    case 0x62: return "KP0";
+    case 0x63: return "KP.";
+    case 0x65: return "Menu";
+    case 0xE0: return "L-Ctrl";
+    case 0xE1: return "L-Shift";
+    case 0xE2: return "L-Alt";
+    case 0xE3: return "L-GUI";
+    case 0xE4: return "R-Ctrl";
+    case 0xE5: return "R-Shift";
+    case 0xE6: return "R-Alt";
+    case 0xE7: return "R-GUI";
+    default: return "Unknown";
+    }
+}
+
+// ADCチャンネル設定 (チャンネル切替時に1回だけ呼ぶ)
+static bool configureADCChannel(ADC_HandleTypeDef* hadc, uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+    return (HAL_ADC_ConfigChannel(hadc, &sConfig) == HAL_OK);
+}
+
+// ADC 1回変換 (チャンネルは設定済み前提)
+static uint32_t readADCOnce(ADC_HandleTypeDef* hadc) {
+    __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_OVR);
+    if (HAL_ADC_Start(hadc) != HAL_OK) {
+        HAL_ADC_Stop(hadc);
+        return 0xFFFF;
+    }
+    if (HAL_ADC_PollForConversion(hadc, 10) != HAL_OK) {
+        HAL_ADC_Stop(hadc);
+        return 0xFFFF;
+    }
+    uint32_t val = HAL_ADC_GetValue(hadc);
+    HAL_ADC_Stop(hadc);
+    return val;
+}
+
+// 後方互換 (setupダミースキャン用)
+static uint32_t readADCChannel(ADC_HandleTypeDef* hadc, uint32_t channel) {
+    if (!configureADCChannel(hadc, channel)) return 0xFFFF;
+    readADCOnce(hadc); // discard
+    return readADCOnce(hadc);
+}
+
 extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* response) {
     usb_rx_cnt++;
     if (len < 1) return;
 
-    // data と response は同じバッファ(Feature_buf)を指すため、
-    // 応答書き込み前に受信データをローカルにコピーする
     uint8_t local[32];
     memcpy(local, data, 32);
 
     uint8_t cmd = local[0];
     last_received_cmd = cmd;
 
-    // 応答バッファをクリア
     memset(response, 0, 32);
-    response[0] = cmd;  // エコーバック
+    response[0] = cmd;
 
     switch (cmd) {
     case CMD_SET_SENSITIVITY: {
-        // local[1]=keyIndex, local[2..3]=value (uint16_t LE)
         uint8_t keyIdx = local[1];
         uint16_t value = (uint16_t)local[2] | ((uint16_t)local[3] << 8);
-
         if (value < 1 || value > 4095) {
-            response[1] = RESP_INVALID_PARAM;
-            break;
+            response[1] = RESP_INVALID_PARAM; break;
         }
-
         keyboard.setSensitivity((int)keyIdx, (uint32_t)value);
         response[1] = RESP_OK;
-        printf("[CFG] SetSens Key:%d Val:%d\r\n", keyIdx, value);
         break;
     }
     case CMD_GET_SENSITIVITY: {
-        // local[1]=keyIndex
         uint8_t keyIdx = local[1];
         if (keyIdx >= RapidTriggerKeyboard::TOTAL_KEY_COUNT && keyIdx != 0xFF) {
-            response[1] = RESP_INVALID_PARAM;
-            break;
+            response[1] = RESP_INVALID_PARAM; break;
         }
-
         response[1] = RESP_OK;
-
         if (keyIdx == 0xFF) {
-            // 全キーの感度を返す (最大17キー × 2バイト = 34 → 32バイトに収まるよう15キー分)
-            // response[2..3]=key0, [4..5]=key1, ...
             int count = RapidTriggerKeyboard::TOTAL_KEY_COUNT;
-            if (count > 15) count = 15; // 32バイト制限
+            if (count > 15) count = 15;
             for (int i = 0; i < count; i++) {
                 uint16_t s = (uint16_t)keyboard.getSensitivity(i);
                 response[2 + i * 2] = (uint8_t)(s & 0xFF);
@@ -110,25 +225,21 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
         break;
     }
     case CMD_SET_KEYCODE: {
-        // local[1]=keyIndex, local[2]=keycode
         uint8_t keyIdx = local[1];
         uint8_t code = local[2];
-        if (keyIdx >= RapidTriggerKeyboard::TOTAL_KEY_COUNT || code == 0 || code >= 120) {
-            response[1] = RESP_INVALID_PARAM;
-            break;
+        if (keyIdx >= RapidTriggerKeyboard::TOTAL_KEY_COUNT) {
+            response[1] = RESP_INVALID_PARAM; break;
         }
         keyboard.setKeycode(keyIdx, code);
         response[1] = RESP_OK;
-        printf("[CFG] SetKeycode Key:%d Code:0x%02X\r\n", keyIdx, code);
         break;
     }
     case CMD_GET_KEYCODE: {
         uint8_t keyIdx = local[1];
         if (keyIdx == 0xFF) {
-            // 全キーのキーコードを返す
             response[1] = RESP_OK;
             int count = RapidTriggerKeyboard::TOTAL_KEY_COUNT;
-            if (count > 30) count = 30; // 32バイト制限
+            if (count > 30) count = 30;
             for (int i = 0; i < count; i++) {
                 response[2 + i] = keyboard.getKeycode(i);
             }
@@ -141,16 +252,11 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
         break;
     }
     case CMD_SET_DEADZONE: {
-        // local[1]=keyIndex, local[2..3]=value (uint16_t LE)
         uint8_t keyIdx = local[1];
         uint16_t value = (uint16_t)local[2] | ((uint16_t)local[3] << 8);
-        if (value > 500) {
-            response[1] = RESP_INVALID_PARAM;
-            break;
-        }
+        if (value > 500) { response[1] = RESP_INVALID_PARAM; break; }
         keyboard.setDeadZone((int)keyIdx, (uint32_t)value);
         response[1] = RESP_OK;
-        printf("[CFG] SetDZ Key:%d Val:%d\r\n", keyIdx, value);
         break;
     }
     case CMD_GET_DEADZONE: {
@@ -175,19 +281,14 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
         break;
     }
     case CMD_SET_LED_MODE: {
-        // local[1]=mode, local[2]=brightness, local[3]=speed
         uint8_t mode = local[1];
         uint8_t bright = local[2];
         uint8_t spd = local[3];
-        if (mode >= LED_MODE_COUNT) {
-            response[1] = RESP_INVALID_PARAM;
-            break;
-        }
+        if (mode >= LED_MODE_COUNT) { response[1] = RESP_INVALID_PARAM; break; }
         keyboard.ledConfig.mode = (LedMode)mode;
         keyboard.ledConfig.brightness = bright;
         if (spd <= 100) keyboard.ledConfig.speed = spd;
         response[1] = RESP_OK;
-        printf("[CFG] SetLED mode:%d bright:%d speed:%d\r\n", mode, bright, spd);
         break;
     }
     case CMD_GET_LED_MODE: {
@@ -198,7 +299,6 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
         break;
     }
     case CMD_SET_MACRO: {
-        // local[1]=key_index, local[2]=step_count, local[3..]=mod0,key0,mod1,key1,...
         uint8_t idx = local[1];
         uint8_t sc  = local[2];
         if (idx < keyboard.TOTAL_KEY_COUNT && sc <= MAX_MACRO_STEPS) {
@@ -209,7 +309,6 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
             }
             keyboard.setMacro(idx, sc, steps);
             response[1] = RESP_OK;
-            printf("[CFG] SetMacro key:%d steps:%d\r\n", idx, sc);
         } else {
             response[1] = RESP_INVALID_PARAM;
         }
@@ -235,13 +334,11 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
         keyboard.saveToFlash();
         response[1] = (keyboard.flash_status == 0) ? RESP_OK : RESP_ERROR;
         response[2] = (uint8_t)keyboard.flash_status;
-        printf("[CFG] SaveFlash status:%d\r\n", keyboard.flash_status);
         break;
     }
     case CMD_RESET_DEFAULTS: {
         keyboard.resetDefaults();
         response[1] = RESP_OK;
-        printf("[CFG] ResetDefaults\r\n");
         break;
     }
     case CMD_GET_KEY_COUNT: {
@@ -255,7 +352,6 @@ extern "C" void ProcessFeatureReport(uint8_t* data, uint16_t len, uint8_t* respo
     }
 }
 
-// 旧Output Report互換 (既存のInterrupt OUT経由)
 extern "C" void ProcessConfigPacket(uint8_t* data, uint16_t len) {
     last_received_len = len;
     usb_rx_cnt++;
@@ -268,15 +364,12 @@ extern "C" void ProcessConfigPacket(uint8_t* data, uint16_t len) {
     }
 
     if (len < 1) return;
-
     uint8_t cmd = data[0];
     uint8_t idx_target = 1;
     uint8_t idx_val = 2;
 
     if (cmd == 0x00 && len > 1) {
-        cmd = data[1];
-        idx_target = 2;
-        idx_val = 3;
+        cmd = data[1]; idx_target = 2; idx_val = 3;
     }
 
     if (cmd == 0x01) {
@@ -286,15 +379,22 @@ extern "C" void ProcessConfigPacket(uint8_t* data, uint16_t len) {
     }
 }
 
+// 前方宣言
+static void DWT_Init(void);
+static inline void delay_us(uint32_t us);
+
 extern "C" void setup()
 {
     keyboard.init();
     keyboard.loadFromFlash();
 
-    printf("=== Rapid Trigger Keyboard ===\r\n");
-    printf("Keys:%d Sensitivity(K0):%lu\r\n",
+    printf("=== Full-size Rapid Trigger Keyboard ===\r\n");
+    printf("Keys:%d Sources:%d\r\n",
            RapidTriggerKeyboard::TOTAL_KEY_COUNT,
-           keyboard.getSensitivity(0));
+           RapidTriggerKeyboard::SOURCE_COUNT);
+
+    // DWTサイクルカウンタ初期化 (us遅延に使用)
+    DWT_Init();
 
     // ADCキャリブレーション
     if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED) != HAL_OK) {
@@ -304,37 +404,101 @@ extern "C" void setup()
         printf("[ERR] ADC2 Calibration Failed\r\n");
     }
 
-    // LED PWM開始 (TIM3 CH2)
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    // センサーの電源安定化待ち
+    HAL_Delay(500);
 
-    // TIM6割り込み開始 (LED減光用)
+    // ADCダミースキャン (内部のS&HキャパシタとMUXのゴミを読む)
+    for (int dummy = 0; dummy < 10; dummy++) {
+        for (int ch = 0; ch < RapidTriggerKeyboard::MUX_CH_COUNT; ch++) {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, (ch & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, (ch & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, (ch & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, (ch & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            for (volatile int w = 0; w < 200; w++);
+            for (int src = 0; src < RapidTriggerKeyboard::SOURCE_COUNT; src++) {
+                readADCChannel(ADC_SOURCES[src].hadc, ADC_SOURCES[src].channel);
+            }
+        }
+    }
+
+    // LED PWM開始
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
     HAL_TIM_Base_Start_IT(&htim6);
 
     printf("Setup complete.\r\n");
     printf("------------------------------\r\n");
 }
 
-// MUX切り替え (PB4-PB7: S0-S3)
-void selectMuxChannel(int channel) {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, (channel & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, (channel & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, (channel & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, (channel & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+// us単位ディレイ (DWTサイクルカウンタ使用)
+static inline void delay_us(uint32_t us) {
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = us * (SystemCoreClock / 1000000);
+    while ((DWT->CYCCNT - start) < ticks);
 }
 
-uint32_t debug_adc1[16];
-uint32_t debug_adc2[16];
+// DWT初期化
+static void DWT_Init(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+// MUX切り替え (PB4-PB7: S0-S3) — BSRR一括アトミック書込み
+void selectMuxChannel(int channel) {
+    // PB4-PB7 のセット/リセットをBSRRで同時に反映
+    uint32_t bsrr = 0;
+    // セットビット (bits 0-15): 該当ピンを HIGH にする
+    // リセットビット (bits 16-31): 該当ピンを LOW にする
+    const uint16_t pins[] = { GPIO_PIN_4, GPIO_PIN_5, GPIO_PIN_6, GPIO_PIN_7 };
+    for (int i = 0; i < 4; i++) {
+        if (channel & (1 << i)) {
+            bsrr |= pins[i];            // Set
+        } else {
+            bsrr |= (uint32_t)pins[i] << 16; // Reset
+        }
+    }
+    GPIOB->BSRR = bsrr;
+}
+
+// 3サンプル中央値 (スパイク除去)
+static uint32_t readADCMedian(ADC_HandleTypeDef* hadc) {
+    uint32_t a = readADCOnce(hadc);
+    uint32_t b = readADCOnce(hadc);
+    uint32_t c = readADCOnce(hadc);
+    // ソート後の中央値
+    if (a > b) { uint32_t t = a; a = b; b = t; }
+    if (b > c) { uint32_t t = b; b = c; c = t; }
+    if (a > b) { uint32_t t = a; a = b; b = t; }
+    return b;
+}
+
+// 高速ADC読み取り (レジスタ直接アクセス, HALオーバーヘッド排除)
+static inline uint32_t readADCFast(ADC_HandleTypeDef* hadc) {
+    ADC_TypeDef* inst = hadc->Instance;
+    // ADCが無効なら有効化
+    if (!(inst->CR & ADC_CR_ADEN)) {
+        inst->ISR = ADC_ISR_ADRDY;
+        inst->CR |= ADC_CR_ADEN;
+        while (!(inst->ISR & ADC_ISR_ADRDY));
+    }
+    // フラグクリア → 変換開始 → 完了待ち → 結果読み取り
+    inst->ISR = ADC_ISR_EOC | ADC_ISR_EOS | ADC_ISR_OVR;
+    inst->CR |= ADC_CR_ADSTART;
+    while (!(inst->ISR & ADC_ISR_EOC));
+    return inst->DR;
+}
 
 extern "C" void loop()
 {
-    // USB経由の設定変更 (旧Output Report互換)
+    static uint32_t mux_adc[RapidTriggerKeyboard::MUX_CH_COUNT][RapidTriggerKeyboard::SOURCE_COUNT] = {{0}};
+    static uint32_t scan_us = 0;
+
     if (config_update_request) {
         config_update_request = false;
         keyboard.setSensitivity((int)config_target, config_val);
-        printf("[CFG] Key:%d Sens:%d\r\n", config_target, (int)config_val);
     }
 
-    // キー押下検出 → LEDモードに応じた制御
+    // キー押下 → LED制御
     {
         KeyboardReport* rpt = keyboard.getReport();
         bool any_key = (rpt->MODIFIER != 0);
@@ -348,92 +512,79 @@ extern "C" void loop()
         uint8_t maxBright = keyboard.ledConfig.brightness;
 
         if (mode == LED_MODE_FADE) {
-            // Fade: キー押下→最大輝度、TIM6で減光
             if (any_key) led_brightness = maxBright;
         } else if (mode == LED_MODE_SOLID) {
-            // Solid: キー押下中=点灯、離すと即消灯
             led_brightness = any_key ? maxBright : 0;
-        } else if (mode == LED_MODE_BLINK || mode == LED_MODE_BREATHING) {
-            // Blink/Breathing: TIM6側で制御
-            // any_keyフラグをグローバルで渡す
         } else if (mode == LED_MODE_OFF) {
             led_brightness = 0;
         }
     }
 
-    // ADCスキャン (全MUXチャンネル)
-    for (int ch = 0; ch < RapidTriggerKeyboard::MUX_CH_COUNT; ch++) {
-        selectMuxChannel(ch);
+    // ===== ADCスキャン (全7ソース · 1kHz高速) =====
+    uint32_t scan_start = DWT->CYCCNT;
 
-        // 信号安定待ち
-        for (volatile int w = 0; w < 200; w++);
+    for (int src = 0; src < RapidTriggerKeyboard::SOURCE_COUNT; src++) {
+        const ADCSourceDef& adc = ADC_SOURCES[src];
 
-        // ADC1 (MUX1)
-        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
-        uint32_t ret1 = HAL_ADC_Start(&hadc1);
-        if (ret1 == HAL_OK) {
-            if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
-                uint32_t val1 = HAL_ADC_GetValue(&hadc1);
-                keyboard.updateKeyByMux(ch, 0, val1);
-                debug_adc1[ch] = val1;
-            } else {
-                HAL_ADC_Stop(&hadc1);
-                debug_adc1[ch] = 8888;
-            }
-        } else {
-            HAL_ADC_Stop(&hadc1);
-            debug_adc1[ch] = 9000 + ret1;
-        }
+        // ADCチャネル設定 (ソースごとに1回)
+        if (!configureADCChannel(adc.hadc, adc.channel)) continue;
 
-        // ADC2 (MUX2)
-        __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_OVR);
-        uint32_t ret2 = HAL_ADC_Start(&hadc2);
-        if (ret2 == HAL_OK) {
-            if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK) {
-                uint32_t val2 = HAL_ADC_GetValue(&hadc2);
-                keyboard.updateKeyByMux(ch, 1, val2);
-                debug_adc2[ch] = val2;
-            } else {
-                HAL_ADC_Stop(&hadc2);
-                debug_adc2[ch] = 8888;
-            }
-        } else {
-            HAL_ADC_Stop(&hadc2);
-            debug_adc2[ch] = 9000 + ret2;
+        // ADC内部S&Hセトリング用ダミー
+        readADCFast(adc.hadc);
+
+        for (int ch = 0; ch < RapidTriggerKeyboard::MUX_CH_COUNT; ch++) {
+            selectMuxChannel(ch);
+            delay_us(5);  // MUXセトリング (5μs)
+
+            // 2サンプル平均 (ノイズ低減 + 高速)
+            uint32_t v1 = readADCFast(adc.hadc);
+            uint32_t v2 = readADCFast(adc.hadc);
+            uint32_t val = (v1 + v2) / 2;
+            keyboard.updateKeyByMux(ch, src, val);
+            mux_adc[ch][src] = val;
         }
     }
 
-    // USBレポート送信
-    KeyboardReport* report = keyboard.getReport();
-    if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) {
-        USBD_CUSTOM_HID_SendReport(&hUsbDeviceFS, (uint8_t*)report, sizeof(KeyboardReport));
+    scan_us = (DWT->CYCCNT - scan_start) / (SystemCoreClock / 1000000);
 
-        // デバッグ出力 (200msに1回)
-        static uint32_t last_print = 0;
-        if (HAL_GetTick() - last_print > 200) {
-            last_print = HAL_GetTick();
+    // USBレポート送信 (1ms間隔でスロットル, 1kHz)
+    static uint32_t last_usb_send = 0;
+    uint32_t now = HAL_GetTick();
+    if (now != last_usb_send) {
+        last_usb_send = now;
+        KeyboardReport* report = keyboard.getReport();
+        if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) {
+            USBD_CUSTOM_HID_SendReport(&hUsbDeviceFS, (uint8_t*)report, sizeof(KeyboardReport));
+        }
+    }
 
-            // ステータス行
-            printf("Sens:%lu LED:%lu | USB[Cmd:%02X Cnt:%lu]\r\n",
-                   keyboard.getSensitivity(0), (uint32_t)led_brightness,
-                   last_received_cmd, usb_rx_cnt);
+    // デバッグ出力 (500msに1回, USB未接続でも出力)
+    static uint32_t last_print = 0;
+    if (HAL_GetTick() - last_print > 500) {
+        last_print = HAL_GetTick();
 
-            // MUX1(ADC1): キー名とADC値
-            printf(" KP0:%4lu KP.:%4lu Ent:%4lu KP3:%4lu KP2:%4lu KP1:%4lu KP6:%4lu KP5:%4lu KP4:%4lu\r\n",
-                   debug_adc1[0],  debug_adc1[15], debug_adc1[14],
-                   debug_adc1[13], debug_adc1[12], debug_adc1[11],
-                   debug_adc1[10], debug_adc1[9],  debug_adc1[8]);
+        printf("Sens:%lu LED:%lu Scan:%luus | USB:%s Keys:%d\r\n",
+               keyboard.getSensitivity(0), (uint32_t)led_brightness,
+               (unsigned long)scan_us,
+               (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED) ? "ON" : "OFF",
+               RapidTriggerKeyboard::TOTAL_KEY_COUNT);
 
-            // MUX2(ADC2): キー名とADC値
-            printf(" KP+:%4lu KP9:%4lu KP8:%4lu KP7:%4lu KP-:%4lu KP*:%4lu KP/:%4lu Num:%4lu\r\n",
-                   debug_adc2[15], debug_adc2[14], debug_adc2[13],
-                   debug_adc2[12], debug_adc2[11], debug_adc2[10],
-                   debug_adc2[9],  debug_adc2[8]);
+        // ON状態のキーのみ表示
+        bool any_active = false;
+        for (int k = 0; k < RapidTriggerKeyboard::TOTAL_KEY_COUNT; k++) {
+            if (keyboard.isKeyActive(k)) {
+                uint8_t code = keyboard.getKeycode(k);
+                printf("  [ON] %s(%02X)\r\n", hidCodeToName(code), code);
+                any_active = true;
+            }
+        }
+        if (!any_active) {
+            printf("  All keys OFF\r\n");
         }
     }
 }
 
-// TIM6 割り込みコールバック: LEDエフェクト処理
+// TIM6 割り込みコールバック
 extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6) {
@@ -443,10 +594,8 @@ extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
         LedMode mode = keyboard.ledConfig.mode;
         uint8_t maxBright = keyboard.ledConfig.brightness;
-        uint8_t speed = keyboard.ledConfig.speed; // 0-100 (0.0-10.0)
+        uint8_t speed = keyboard.ledConfig.speed;
 
-        // speed: 0=最遅, 100=最速。アキュムレータ方式で0.1刻み対応
-        // divider = 110 - speed (10〜110), カウンタ += 3 (低速寄り)
         uint32_t threshold = 110 - speed;
         sub_counter += 3;
 
@@ -456,12 +605,10 @@ extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
             switch (mode) {
             case LED_MODE_FADE:
-                // 徐々に減光 (キー押下でled_brightnessがmaxBrightにセットされる)
                 if (led_brightness > 0) led_brightness--;
                 break;
 
             case LED_MODE_BLINK:
-                // 約256カウントで1周期の点滅
                 if (effect_counter >= 128) {
                     effect_counter = 0;
                     blink_on = !blink_on;
@@ -470,32 +617,21 @@ extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 break;
 
             case LED_MODE_BREATHING: {
-                // サイン波近似: 三角波で呼吸エフェクト
                 uint32_t phase = effect_counter % 512;
                 uint32_t level;
-                if (phase < 256) {
-                    level = phase; // 0→255
-                } else {
-                    level = 511 - phase; // 255→0
-                }
+                if (phase < 256) level = phase;
+                else level = 511 - phase;
                 led_brightness = (level * maxBright) / 255;
                 break;
             }
 
             case LED_MODE_SOLID:
-                // loop()側で制御 (キー押下=ON、離す=OFF)
-                break;
-
             case LED_MODE_OFF:
-                led_brightness = 0;
-                break;
-
             default:
                 break;
             }
         }
 
-        // ガンマ2.0補正: PWM = brightness² (0-65025)
         uint32_t pwm_val = (uint32_t)led_brightness * led_brightness;
         __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm_val);
     }
